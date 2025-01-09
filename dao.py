@@ -104,3 +104,68 @@ async def get_place(session,
         return place
     except SQLAlchemyError as e:
         logger.error(f"Ошибка при поиске места: {e}")
+
+
+@connection
+async def get_user_rating_matrix(session, user_id: int):
+    users = await session.execute( select(User.id).order_by(User.id))
+    users = [user[0] for user in users]
+    
+    places = await session.execute( select(Place.id).order_by(Place.id))
+    places = [place[0] for place in places]
+    
+    rating_matrix = np.zeros((len(users), len(places)))
+    
+    ratings = await session.execute( select(Rating.user_id, Rating.place_id, Rating.rating))
+    
+    for user_id, place_id, rating in ratings:
+        user_index = users.index(user_id)
+        place_index = places.index(place_id)
+        rating_matrix[user_index, place_index] = rating
+    
+    return users, places, rating_matrix
+
+
+async def find_similar_users(user_id, top_n=5):
+    users, places, rating_matrix = await get_user_rating_matrix(user_id)
+    user_index = users.index(user_id)
+    user_vector = rating_matrix[user_index].reshape(1, -1)
+    
+    similarities = cosine_similarity(user_vector, rating_matrix)[0]
+    
+    similar_users = [
+        (users[i], similarity)
+        for i, similarity in enumerate(similarities)
+        if users[i] != user_id
+    ]
+    similar_users.sort(key=lambda x: x[1], reverse=True)
+    
+    return similar_users[:top_n]
+
+@connection
+async def get_best_place(session,
+                   offset: Optional[int] = 0,
+                   user_id: Optional[int] = 0,
+                   active_recreation: Optional[int] = 0,
+                   cultural_event: Optional[int] = 0, 
+                   nightlife: Optional[int] = 0) -> Optional[Place]:
+    try:
+        bestUsers = await find_similar_users(user_id, 2)
+        best_id = [bestUser[0] for bestUser in bestUsers]
+
+        result = await session.execute( select(Place, func.avg(Rating.rating).label('average_rating'))\
+        .join(Rating, Place.id == Rating.place_id, isouter=True)\
+        .filter(not_(Place.id.in_(select(Rating.id).filter(Rating.user_id == user_id).subquery())))\
+        .filter(Rating.user_id.in_(best_id))\
+        .group_by(Place.id)\
+        .order_by(func.avg(Rating.rating).desc())\
+        .offset(offset - 1) \
+        .limit(1))
+
+        result = result.first()
+        if not result:
+            return
+        place, average_rating = result
+        return place
+    except SQLAlchemyError as e:
+        logger.error(f"Ошибка при поиске места: {e}")
